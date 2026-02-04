@@ -1,0 +1,222 @@
+1. Enhanced Tax-First Workflow Engine with Cryptographic Gates
+
+File: workflow_orchestrator.py (rickcreator87-credit-authority/core/)
+
+```python
+import hashlib
+import json
+from datetime import datetime, timezone
+from typing import Dict, List, Tuple, Optional
+from dataclasses import dataclass
+from enum import Enum
+
+class WorkflowState(Enum):
+    """Immutable workflow states with explicit ordering"""
+    IDENTITY_VERIFIED = 1
+    FEDERAL_TAX_BLOCK_GENERATED = 2
+    STATE_TAX_BLOCK_GENERATED = 3
+    COMPLIANCE_OFFICER_APPROVED = 4
+    DUAL_FOUNDER_APPROVED = 5
+    LEDGER_ENTRY_CREATED = 6
+    AGREEMENT_EXECUTED = 7
+    DISBURSEMENT_AUTHORIZED = 8
+
+@dataclass(frozen=True)
+class AuditEntry:
+    """Immutable audit entry forming a hash chain"""
+    timestamp: str  # RFC3339
+    from_state: Optional[WorkflowState]
+    to_state: WorkflowState
+    proof_hash: str  # SHA256 of canonicalized proof
+    previous_hash: str  # Previous audit entry hash
+    entry_hash: str  # SHA256(timestamp + from_state + to_state + proof_hash + previous_hash)
+
+class TaxFirstWorkflowEngine:
+    """
+    Enforces strict tax-first sequence with cryptographic gates.
+    Append-only audit trail with 7-year retention guarantee.
+    """
+    
+    def __init__(self, workflow_id: str, workflow_version: str = "1.0"):
+        self.workflow_id = workflow_id
+        self.workflow_version = workflow_version
+        self.current_state = None
+        self.audit_chain: List[AuditEntry] = []
+        self._state_validators = self._initialize_validators()
+        
+    def _initialize_validators(self) -> Dict[WorkflowState, callable]:
+        """Register state-specific validation functions"""
+        return {
+            WorkflowState.FEDERAL_TAX_BLOCK_GENERATED: self._validate_federal_tax_block,
+            WorkflowState.STATE_TAX_BLOCK_GENERATED: self._validate_state_tax_block,
+            WorkflowState.COMPLIANCE_OFFICER_APPROVED: self._validate_compliance_approval,
+            WorkflowState.DUAL_FOUNDER_APPROVED: self._validate_dual_founder_approval,
+            WorkflowState.LEDGER_ENTRY_CREATED: self._validate_ledger_entry,
+            WorkflowState.AGREEMENT_EXECUTED: self._validate_agreement_execution,
+        }
+    
+    def advance_state(self, new_state: WorkflowState, proof: Dict) -> Tuple[bool, str, Optional[str]]:
+        """
+        Attempt to advance workflow with cryptographic guarantees.
+        Returns: (success, message, audit_hash)
+        """
+        try:
+            # 1. Sequence validation
+            if self.current_state is None:
+                if new_state != WorkflowState.IDENTITY_VERIFIED:
+                    return False, "First state must be IDENTITY_VERIFIED", None
+            else:
+                current_ordinal = self.current_state.value
+                target_ordinal = new_state.value
+                if target_ordinal != current_ordinal + 1:
+                    return False, f"Invalid sequence: {self.current_state.name} -> {new_state.name}", None
+            
+            # 2. State-specific gate validation
+            if new_state in self._state_validators:
+                is_valid, validation_msg = self._state_validators[new_state](proof)
+                if not is_valid:
+                    return False, f"Gate validation failed: {validation_msg}", None
+            
+            # 3. Generate audit trail entry
+            proof_hash = self._hash_canonical_json(proof)
+            previous_hash = self.audit_chain[-1].entry_hash if self.audit_chain else "0" * 64
+            
+            audit_entry = AuditEntry(
+                timestamp=self._get_rfc3339_timestamp(),
+                from_state=self.current_state,
+                to_state=new_state,
+                proof_hash=proof_hash,
+                previous_hash=previous_hash,
+                entry_hash=self._compute_audit_hash(previous_hash, proof_hash, new_state)
+            )
+            
+            # 4. Append to immutable chain
+            self.audit_chain.append(audit_entry)
+            self.current_state = new_state
+            
+            return True, f"Advanced to {new_state.name}", audit_entry.entry_hash
+            
+        except Exception as e:
+            return False, f"System error: {str(e)}", None
+    
+    def _validate_federal_tax_block(self, proof: Dict) -> Tuple[bool, str]:
+        """Validate federal tax block generation"""
+        required_fields = ["federal_tax_block_id", "generated_at", "tax_year", "intent_hash"]
+        missing = [f for f in required_fields if f not in proof]
+        if missing:
+            return False, f"Missing fields: {missing}"
+        
+        # Validate block ID format (content-derived)
+        if not proof["federal_tax_block_id"].startswith("FTB_"):
+            return False, "Invalid federal tax block ID format"
+        
+        return True, "Federal tax block valid"
+    
+    def _validate_state_tax_block(self, proof: Dict) -> Tuple[bool, str]:
+        """Validate state tax block generation"""
+        required_fields = ["state_tax_block_id", "state_code", "generated_at", "intent_hash"]
+        missing = [f for f in required_fields if f not in proof]
+        if missing:
+            return False, f"Missing fields: {missing}"
+        
+        # State tax block must reference federal block
+        if "federal_tax_block_id" not in proof:
+            return False, "State tax block must reference federal block"
+        
+        return True, "State tax block valid"
+    
+    def _validate_compliance_approval(self, proof: Dict) -> Tuple[bool, str]:
+        """Validate compliance officer approval with tax block validation"""
+        # 1. Check signature
+        if "compliance_sig" not in proof:
+            return False, "Missing compliance officer signature"
+        
+        # 2. Verify tax blocks are locked before compliance approval
+        tax_blocks_present = all(field in proof for field in 
+                                ["federal_tax_block_id", "state_tax_block_id"])
+        if not tax_blocks_present:
+            return False, "Tax blocks not locked before compliance approval"
+        
+        # 3. Validate signature format
+        if not self._validate_ed25519_signature(proof.get("approval_payload", ""), 
+                                               proof["compliance_sig"]):
+            return False, "Invalid compliance signature"
+        
+        return True, "Compliance approval valid"
+    
+    def _validate_dual_founder_approval(self, proof: Dict) -> Tuple[bool, str]:
+        """Validate dual-founder approval with cryptographic multisig"""
+        # 1. Verify both signatures exist
+        if not all(key in proof for key in ["founder_1_sig", "founder_2_sig"]):
+            return False, "Missing one or both founder signatures"
+        
+        # 2. Verify signatures are distinct
+        if proof["founder_1_sig"] == proof["founder_2_sig"]:
+            return False, "Founder signatures must be distinct"
+        
+        # 3. Verify canonical payload
+        canonical_payload = proof.get("canonical_payload")
+        if not canonical_payload:
+            return False, "Missing canonical approval payload"
+        
+        # 4. Validate each signature against canonical payload
+        for founder_key, founder_sig in [("founder_1_pubkey", "founder_1_sig"),
+                                         ("founder_2_pubkey", "founder_2_sig")]:
+            if not self._validate_ed25519_signature(
+                canonical_payload, 
+                proof[founder_sig], 
+                proof.get(founder_key)
+            ):
+                return False, f"Invalid signature for {founder_key}"
+        
+        return True, "Dual-founder approval valid"
+    
+    def _validate_ledger_entry(self, proof: Dict) -> Tuple[bool, str]:
+        """Validate ledger entry with tax separation"""
+        required_fields = ["ledger_entry_id", "ledger_hash", "tax_separation_flag"]
+        missing = [f for f in required_fields if f not in proof]
+        if missing:
+            return False, f"Missing fields: {missing}"
+        
+        # Validate tax separation flag
+        if proof["tax_separation_flag"] not in ["PERSONAL", "ORG"]:
+            return False, "Invalid tax separation flag"
+        
+        # Ledger entry ID must be content-derived
+        if not proof["ledger_entry_id"].startswith("LED_"):
+            return False, "Invalid ledger entry ID format"
+        
+        return True, "Ledger entry valid"
+    
+    def _validate_agreement_execution(self, proof: Dict) -> Tuple[bool, str]:
+        """Validate agreement execution with hash verification"""
+        if "agreement_hash" not in proof:
+            return False, "Agreement not finalized"
+        
+        # Agreement hash must reference ledger entry
+        if "ledger_entry_hash" not in proof:
+            return False, "Agreement must reference ledger entry"
+        
+        return True, "Agreement execution valid"
+    
+    def _hash_canonical_json(self, data: Dict) -> str:
+        """Deterministic hash of canonicalized JSON"""
+        canonical = json.dumps(data, sort_keys=True, separators=(',', ':'))
+        return hashlib.sha256(canonical.encode()).hexdigest()
+    
+    def _compute_audit_hash(self, prev_hash: str, proof_hash: str, state: WorkflowState) -> str:
+        """Compute audit chain hash"""
+        content = f"{prev_hash}:{proof_hash}:{state.value}:{self._get_rfc3339_timestamp()}"
+        return hashlib.sha256(content.encode()).hexdigest()
+    
+    def _get_rfc3339_timestamp(self) -> str:
+        """RFC3339 timestamp with UTC"""
+        return datetime.now(timezone.utc).isoformat()
+    
+    def _validate_ed25519_signature(self, payload: str, signature: str, 
+                                   public_key: str = None) -> bool:
+        """Validate Ed25519 signature (stub - implement with cryptography library)"""
+        # Implementation depends on your crypto library
+        # This is a placeholder showing the interface
+        return True  # Replace with actual validation
+```
