@@ -1,3 +1,6 @@
+![Identity](https://img.shields.io/badge/Identity-RDK%20VERIFIED-orange?style=for-the-badge&logo=id.me&logoColor=white)
+https://img.shields.io/badge/Identity-RDK%20VERIFIED-orange?style=for-the-badge&logo=id.me&logoColor=white
+
 # Authority's purpose and technical structure.
 # RickCreator87 Credit Authority (RCCA)
 
